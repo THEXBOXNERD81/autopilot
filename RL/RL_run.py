@@ -4,116 +4,12 @@ from gym import spaces
 import threading
 import time
 import numpy as np
-from stable_baselines3 import PPO, TD3, SAC
-
-# def parse_state(csv_line):
-#     """
-#     Parses a CSV string containing flight state data.
-#     Expected CSV format: timestamp, airspeed, pitch, bank, heading, verticalSpeed, engineRPM, altitude
-#     We ignore the timestamp and return a raw state vector with 7 elements.
-#     """
-#     parts = csv_line.strip().split(',')
-#     if len(parts) != 8:
-#         print("Invalid data length:", csv_line)
-#         return None
-#     try:
-#         # Convert parts 1 to 7 (ignoring timestamp at index 0) to float
-#         state = np.array([float(x) for x in parts[1:]], dtype=np.float32)
-#         return state
-#     except Exception as e:
-#         print("Parsing error:", e)
-#         return None
-
-# def normalize_state(raw_state):
-#     """
-#     Normalize raw state values to [-1,1] using the same ranges as in training.
-#     Order: Airspeed, Pitch, Bank, Heading, VerticalSpeed, EngineRPM, Altitude.
-#     """
-#     norms = [
-#         (0, 250),       # Airspeed (knots)
-#         (-60, 60),      # Pitch (degrees)
-#         (-90, 90),      # Bank (degrees)
-#         (0, 359),       # Heading (degrees true)
-#         (-10000, 10000),# Vertical speed (ft/min)
-#         (0, 3000),      # EngineRPM
-#         (0, 10000)      # Altitude (feet)
-#     ]
-#     return np.array([2 * ((raw_state[i] - mn) / (mx - mn)) - 1 
-#                      for i, (mn, mx) in enumerate(norms)], dtype=np.float32)
-
-# def main():
-#     host = 'localhost'
-#     port = 54000
-
-#     # Create a TCP/IP socket and connect to the C++ server
-#     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-#     client_socket.connect(
-#         (host, port))
-#     print(f"Connected to server at {host}:{port}")
-
-#     # Load the pre-trained RL model
-#     model = SAC.load("best_model.zip")
-    
-#     # Set a timeout for recv so that we don't block indefinitely
-#     client_socket.settimeout(1.0)
-
-#     try:
-#         while True:
-#             try:
-#                 # Receive state data
-#                 data = client_socket.recv(4096)
-#                 if not data:
-#                     print("No data received. Connection might be closed.")
-#                     break
-#                 csv_line = data.decode('utf-8')
-#                 print("Received state:", csv_line.strip())
-
-#                 # Parse the CSV string into a raw state vector (7 elements)
-#                 raw_state = parse_state(csv_line)
-#                 if raw_state is None:
-#                     print("Failed to parse state data.")
-#                     continue
-
-#                 # Normalize the raw state before feeding it into the model
-#                 norm_state = normalize_state(raw_state)
-#                 obs = norm_state.reshape(1, -1)
-
-#                 # Get action from the model (model expects normalized observations)
-#                 action, _ = model.predict(obs, deterministic=True)
-#                 action = np.array(action).flatten()  # Ensure flat array
-
-#                 # Format the action into a command string.
-#                 # For example, if the command expects: THROTTLE, ELEVATOR, AILERON, RUDDER.
-#                 command = f"THROTTLE:{0.70:.2f},ELEVATOR:{float(action[0]):.2f},AILERON:{float(action[1]):.2f},RUDDER:{0.00:.2f}\n"
-#                 print("Sending command:", command.strip())
-
-#                 # Send the command to the simulator
-#                 client_socket.sendall(command.encode('utf-8'))
-
-#             except socket.timeout:
-#                 continue
-#             except Exception as e:
-#                 print("Error:", e)
-#                 break
-
-#             time.sleep(0.1)
-
-#     except KeyboardInterrupt:
-#         print("Interrupted by user.")
-
-#     finally:
-#         client_socket.close()
-#         print("Connection closed.")
-
-# if __name__ == '__main__':
-#     main()
-
+from stable_baselines3 import TD3
 
 class RealTimeFlightEnv(gym.Env):
-    def __init__(self, host='127.0.0.1', port=54000, episode_length=200, target_speed=150):
+    def __init__(self, host='127.0.0.1', port=54000, episode_length=1000, target_speed=150, logging=True):
         super(RealTimeFlightEnv, self).__init__()
         
-        # Observation space remains with 7 values
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
@@ -121,7 +17,6 @@ class RealTimeFlightEnv(gym.Env):
             dtype=np.float32
         )
         
-        # Action space now has only 2 actions: Elevator (pitch) and Aileron (bank)
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0], dtype=np.float32),
             high=np.array([1.0, 1.0], dtype=np.float32),
@@ -136,7 +31,7 @@ class RealTimeFlightEnv(gym.Env):
         # Socket setup: connect to simulator
         self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.client_socket.connect((host, port))
-        self.client_socket.settimeout(3.0)
+        self.client_socket.settimeout(None)
 
         # State management
         self.state = None
@@ -146,12 +41,16 @@ class RealTimeFlightEnv(gym.Env):
         self.recv_thread.start()
 
         # Open CSV log file for observations (raw and normalized)
-        self.log_csv_file = open("observations.csv", "w")
+        if logging:
+            self.log_csv_file = open("observations.csv","w")
+        else:
+            self.log_csv_file = None
         header = "timestamp," + ",".join([f"raw_{i}" for i in range(7)]) + "," + ",".join([f"norm_{i}" for i in range(7)]) + "\n"
         self.log_csv_file.write(header)
         self.log_csv_file.flush()
 
         # Initialize previous action and error for reward calculations.
+        self.prev_heading = None
         self.prev_action = None
         self.prev_error = None
         self.prev_state = None
@@ -178,14 +77,11 @@ class RealTimeFlightEnv(gym.Env):
                             log_line = f"{ts},{raw_str},{norm_str}\n"
                             self.log_csv_file.write(log_line)
                             self.log_csv_file.flush()
-                            # extract only the raw pitch & bank from the 7-element state
                             raw_pitch = state[1]
                             raw_bank  = state[2]
                             raw_heading = state[3]
 
-                            # normalize those two values
                             full_norm = self._normalize_state((raw_pitch, raw_bank, raw_heading))
-                            # full_norm[0] is norm_pitch, full_norm[1] is norm_bank
                             norm_pitch, norm_bank, norm_heading = full_norm[0], full_norm[1], full_norm[2]
 
                             ts = time.time()
@@ -230,62 +126,46 @@ class RealTimeFlightEnv(gym.Env):
         return 2 * ((value - min_val) / (max_val - min_val)) - 1
 
     def _calculate_reward(self, obs, action):
-        # For reward, we still compare the normalized pitch and bank against targets.
-        # Here, we use a normalization range for pitch and bank appropriate for a stable flight.
         pitch = obs[0]
         bank = obs[1]
         heading = obs[2]
         pitch_rate = obs[3]
         bank_rate  = obs[4]
         heading_rate = obs[5]
-        
-        # Define target values (normalized)
-        target_airspeed = self._normalize_value(self.target_speed, 0, 250)
-        target_heading = self._normalize_value(270, 0, 359)
-        target_vertical_speed = 0.0
-        target_engineRPM = self._normalize_value(2000, 0, 3000)
-        target_altitude = self._normalize_value(3000, 0, 10000)
-
-
+    
         # Compute errors (using squared error)
-        # error_airspeed = (self._normalize_value(obs[0], 0, 250) - target_airspeed) ** 2
         error_pitch = pitch**2
         error_bank = bank**2
-        # error_heading = (heading - self.prev_heading)**2
-        # self.prev_heading = heading.copy()
+        error_heading = (heading - self.prev_heading)**2
+        self.prev_heading = heading
 
         # Define weights for each term
-        w_speed = 0.0
         w_pitch = 1.0
         w_bank = 1.0
         w_heading = 1.0
-        w_altitude = 0.0
-        w_rate = 0.5       # tune this weight
-
-
+        w_rate = 0.5       
+        
         pitch_reward = np.exp(-16.0 * (w_pitch * error_pitch))
         bank_reward = np.exp(-16.0 * (w_bank * error_bank))
-        # heading_reward = np.exp(-16.0 * (w_heading * error_heading))
+        heading_reward = np.exp(-16.0 * (w_heading * error_heading))
 
         rate_penalty = w_rate * (pitch_rate**2 + bank_rate**2 + heading_rate**2)
 
-        reward = pitch_reward + bank_reward - rate_penalty # + heading_reward
-        # reward += (w_pitch * pitch_penalty + w_bank * bank_penalty)    
+        reward = pitch_reward + bank_reward - rate_penalty + heading_reward
         
-        # Progress Reward
-        # progress_lambda = 0.5
-        # if self.prev_error is not None and total_error < self.prev_error:
-        #     reward += progress_lambda
-        # self.prev_error = total_error
+        w_act    = 6.0      
+        threshold = 0.2     # normalized units
+
+        inside_amount = np.maximum(threshold - np.abs(action), 0.0)
+        action_bonus = w_act * np.sum(inside_amount**2)
+        reward += action_bonus
 
         # Smoothness Reward
-        w_a = 0.1
-        if self.prev_action is not None:
-            delta_action = np.linalg.norm(action - self.prev_action)
-            reward -= w_a * abs(delta_action)
+        w_action = 0.5
+        action_norm = np.linalg.norm(action)
+        reward -= w_action * max(0.0, action_norm - 0.1)
         
         # Safety Boundaries Reward:
-        # If pitch or bank deviate beyond a safe normalized threshold, penalize heavily.
         safety_threshold = 0.1  # Adjust threshold (normalized)
         gamma = 5.0
         if abs(pitch) > safety_threshold or abs(bank) > safety_threshold:
@@ -295,13 +175,10 @@ class RealTimeFlightEnv(gym.Env):
         return np.clip(reward, -10.0, 10.0).item()
 
     def step(self, action):
-        # Clip and prepare action (only two controls: elevator and aileron)
         action = np.clip(action, self.action_space.low, self.action_space.high)
         action = np.nan_to_num(action, nan=0.0)
-        # Since only pitch and bank are controlled, we set fixed throttle and rudder.
         fixed_throttle = 0.8
         fixed_rudder = 0.0
-        fixed_aileron = 0.0
         # Construct a full command with fixed values:
         command = (
             f"THROTTLE:{fixed_throttle:.2f},"
@@ -319,6 +196,7 @@ class RealTimeFlightEnv(gym.Env):
         self.current_step += 1
         done = self.current_step >= self.episode_length
         self.prev_action = action.copy()
+
         return obs, reward, done, {}
 
     def _get_observation(self):
@@ -331,7 +209,7 @@ class RealTimeFlightEnv(gym.Env):
             time.sleep(0.01)
         else:
             # timed out without state → return zeros
-            return np.zeros(4, dtype=np.float32)
+            return np.zeros(6, dtype=np.float32)
         # if no previous, zero rates
         if not hasattr(self, 'prev_pitch'):
             d_pitch = 0.0
@@ -343,7 +221,6 @@ class RealTimeFlightEnv(gym.Env):
             d_bank  = (bank  - self.prev_bank ) / dt
             d_heading  = (heading  - self.prev_heading ) / dt
 
-        # clip to [-1,1] or whatever range you choose
         d_pitch = np.clip(d_pitch, -1.0, 1.0)
         d_bank  = np.clip(d_bank,  -1.0, 1.0)
         d_heading  = np.clip(d_heading,  -1.0, 1.0)
@@ -351,7 +228,6 @@ class RealTimeFlightEnv(gym.Env):
         # save for next call
         self.prev_pitch, self.prev_bank, self.prev_heading, self.prev_ts = pitch, bank, heading, ts
 
-        # return a 4-vector
         return np.array([pitch, bank, heading, d_pitch, d_bank, d_heading], dtype=np.float32)
 
     def reset(self):
@@ -371,6 +247,8 @@ class RealTimeFlightEnv(gym.Env):
         except Exception as e:
             print(f"Command send failed: {str(e)}")
         self.state = None
+        obs = self._get_observation()
+        self.prev_heading = obs[2]
         self.prev_action = np.zeros(self.action_space.shape, dtype=np.float32)
         self.prev_error = None
         timeout = time.time() + 5.0
@@ -392,8 +270,6 @@ class RealTimeFlightEnv(gym.Env):
         self.recv_thread.join()
         self.client_socket.close()
         self.log_csv_file.close()
-
-
 
 # 1) instantiate your env exactly as in training
 env = RealTimeFlightEnv(host="127.0.0.1", port=54000, episode_length=1000)
